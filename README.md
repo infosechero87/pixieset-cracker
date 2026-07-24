@@ -83,6 +83,24 @@ python3 pixieset_cracker.py -u subdomain.pixieset.com -g jill -o results.json
 4. Analyzes the response: redirect away from `/guestlogin/` = success, stay on login = failure
 5. Exports results to JSON
 
+## Web UI
+
+A Flask-based web interface with four analysis tabs:
+
+```bash
+# Start the web UI
+python3 pixieset_webui.py --host 0.0.0.0 --port 5000
+
+# Custom port
+python3 pixieset_webui.py --port 8080
+```
+
+**Tabs:**
+- **Source Analyzer** — Scrapes a URL, extracts forms, JavaScript, hidden inputs, HTML comments, meta tags, API endpoints, and generates a security assessment
+- **Proxy/Intercept** — Burp Suite-style request/repeater. Send custom HTTP requests and inspect raw responses, headers, redirects, and security-relevant patterns
+- **Password Tester** — Test passwords manually against Pixieset galleries with auto-detected form fields
+- **JS Scanner** — Fetches and analyzes external JavaScript files for endpoints, secrets, and patterns
+
 ## Limitations
 
 - **3 passwords per gallery per run** — Pixieset's CAPTCHA is hard-capped. Rotate galleries or wait for the block to lift.
