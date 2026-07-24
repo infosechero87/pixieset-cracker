@@ -1,0 +1,18 @@
+#cloud-config
+# Paste into Vultr → Deploy Server → Cloud-Init / User Data
+# After ~60-90s proxy listens on :3128
+package_update: true
+packages:
+  - squid
+write_files:
+  - path: /etc/squid/conf.d/open.conf
+    content: |
+      http_port 3128
+      acl all src 0.0.0.0/0
+      http_access allow all
+runcmd:
+  - sed -i 's/^http_access deny all/# http_access deny all/' /etc/squid/squid.conf || true
+  - systemctl enable squid
+  - systemctl restart squid
+  - ufw allow 3128/tcp || true
+final_message: "pixieset-proxy ready on port 3128"

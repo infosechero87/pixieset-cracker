@@ -1,0 +1,189 @@
+# Copy this file to: .github/workflows/vultr-proxies.yml
+# Then enable GitHub Actions and set secret VULTR_API_KEY
+#
+# Cloud-hosted Vultr proxy farm — runs on GitHub runners
+# ONE-TIME: Vultr API Access Control → enable Any IPv4 (0.0.0.0/0)
+
+name: Vultr Proxy Farm
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy | destroy | list"
+        required: true
+        default: deploy
+        type: choice
+        options:
+          - deploy
+          - destroy
+          - list
+
+permissions:
+  contents: write
+
+env:
+  VULTR_API: https://api.vultr.com/v2
+  PLAN: vc2-1c-1gb
+  OS_ID: "1743"
+  LABEL_PREFIX: pixieset-proxy
+
+jobs:
+  proxies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require secret
+        env:
+          VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+        run: |
+          if [ -z "$VULTR_API_KEY" ]; then
+            echo "::error::Missing secret VULTR_API_KEY"
+            exit 1
+          fi
+
+      - name: Auth check
+        env:
+          VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+        run: |
+          code=$(curl -s -o /tmp/acc.json -w "%{http_code}" \
+            -H "Authorization: Bearer $VULTR_API_KEY" \
+            "$VULTR_API/account")
+          echo "HTTP $code"
+          cat /tmp/acc.json
+          if [ "$code" != "200" ]; then
+            echo "::error::Enable Vultr Access Control → Any IPv4 (0.0.0.0/0)"
+            exit 1
+          fi
+
+      - name: List
+        if: inputs.action == 'list'
+        env:
+          VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+        run: |
+          curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+            "$VULTR_API/instances?per_page=100" | python3 -c "
+import sys,json,os
+p=os.environ['LABEL_PREFIX']
+for i in json.load(sys.stdin).get('instances',[]):
+    if i.get('label','').startswith(p):
+        print(f\"{i['label']:40} {i.get('main_ip','?'):16} {i.get('region'):5} {i.get('status')}\")
+"
+
+      - name: Destroy
+        if: inputs.action == 'destroy'
+        env:
+          VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+        run: |
+          curl -s -H "Authorization: Bearer $VULTR_API_KEY" \
+            "$VULTR_API/instances?per_page=100" > /tmp/inst.json
+          python3 <<'PY'
+import json, os, subprocess
+key, api, p = os.environ["VULTR_API_KEY"], os.environ["VULTR_API"], os.environ["LABEL_PREFIX"]
+ids = [i["id"] for i in json.load(open("/tmp/inst.json")).get("instances",[]) if i.get("label","").startswith(p)]
+print(f"destroying {len(ids)}")
+for i in ids:
+    r = subprocess.run(["curl","-s","-o","/dev/null","-w","%{http_code}","-X","DELETE",
+        "-H",f"Authorization: Bearer {key}", f"{api}/instances/{i}"], capture_output=True, text=True)
+    print(i, r.stdout)
+PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-files --error-unmatch proxies.txt >/dev/null 2>&1; then
+            git rm -f proxies.txt
+            git commit -m "chore: remove proxies.txt after destroy" || true
+            git push || true
+          fi
+
+      - name: Deploy 5 Squid proxies
+        if: inputs.action == 'deploy'
+        env:
+          VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
+        run: |
+          set -euo pipefail
+          USER_DATA_B64=$(python3 -c "import base64; print(base64.b64encode(b'''#!/bin/bash
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq squid
+          cat >/etc/squid/conf.d/open.conf <<EOF
+          http_port 3128
+          acl all src 0.0.0.0/0
+          http_access allow all
+          EOF
+          sed -i \"s/^http_access deny all/# http_access deny all/\" /etc/squid/squid.conf || true
+          systemctl enable squid
+          systemctl restart squid
+          ufw allow 3128/tcp 2>/dev/null || true
+          '''.replace(b'          ', b'')).decode())")
+
+          # cleaner userdata may run with leading spaces stripped above
+
+          REGIONS=(ewr lax fra sgp syd)
+          : > /tmp/ids.txt
+          for region in "${REGIONS[@]}"; do
+            label="${LABEL_PREFIX}-${region}-${GITHUB_RUN_ID}"
+            echo "Creating $label..."
+            resp=$(curl -s -X POST \
+              -H "Authorization: Bearer $VULTR_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"region\":\"$region\",\"plan\":\"$PLAN\",\"os_id\":$OS_ID,\"label\":\"$label\",\"hostname\":\"proxy-$region\",\"user_data\":\"$USER_DATA_B64\",\"backups\":\"disabled\"}" \
+              "$VULTR_API/instances")
+            id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('instance',{}).get('id',''))" || true)
+            if [ -z "$id" ]; then
+              echo "FAILED: $resp"
+              continue
+            fi
+            echo "$id $region" | tee -a /tmp/ids.txt
+          done
+
+          [ -s /tmp/ids.txt ] || { echo "::error::No instances created"; exit 1; }
+
+          echo "Waiting for IPs + Squid..."
+          : > proxies.txt
+          for n in $(seq 1 45); do
+            ready=0; total=0
+            while read -r id region; do
+              [ -z "$id" ] && continue
+              total=$((total+1))
+              info=$(curl -s -H "Authorization: Bearer $VULTR_API_KEY" "$VULTR_API/instances/$id")
+              ip=$(echo "$info" | python3 -c "import sys,json; print(json.load(sys.stdin).get('instance',{}).get('main_ip') or '')")
+              st=$(echo "$info" | python3 -c "import sys,json; i=json.load(sys.stdin).get('instance',{}); print(i.get('server_status') or i.get('status') or '')")
+              if [ -n "$ip" ] && [ "$ip" != "0.0.0.0" ]; then
+                if grep -qF "http://$ip:3128" proxies.txt 2>/dev/null; then
+                  ready=$((ready+1)); continue
+                fi
+                if curl -sS -m 10 -x "http://$ip:3128" https://api.ipify.org >/tmp/egress 2>/dev/null; then
+                  echo "OK $region $ip egress=$(cat /tmp/egress)"
+                  echo "http://$ip:3128" >> proxies.txt
+                  ready=$((ready+1))
+                else
+                  echo "boot $region $ip status=$st"
+                fi
+              else
+                echo "wait $region status=$st"
+              fi
+            done < /tmp/ids.txt
+            [ "$ready" -ge "$total" ] && [ "$total" -gt 0 ] && break
+            sleep 8
+          done
+
+          cat proxies.txt
+          [ -s proxies.txt ] || { echo "::error::No working proxies"; exit 1; }
+
+      - name: Commit proxies.txt
+        if: inputs.action == 'deploy'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add proxies.txt
+          git commit -m "chore: update cloud proxy list" || echo "no change"
+          git push || true
+
+      - name: Upload artifact
+        if: inputs.action == 'deploy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxies
+          path: proxies.txt
+          retention-days: 7

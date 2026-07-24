@@ -101,6 +101,45 @@ python3 pixieset_webui.py --port 8080
 - **Password Tester** — Test passwords manually against Pixieset galleries with auto-detected form fields
 - **JS Scanner** — Fetches and analyzes external JavaScript files for endpoints, secrets, and patterns
 
+## Cloud Proxy Farm (Vultr)
+
+Get **new public IPs** hosted on Vultr for proxy rotation.
+
+### Option A — Vultr console (easiest, fully cloud, no API)
+
+1. Open https://my.vultr.com/deploy/
+2. Deploy **Ubuntu 22.04** · **Regular Cloud Compute** · cheapest plan · any region
+3. Expand **Limited User Data / Cloud-Init** and paste contents of `cloud-init-squid.yaml`
+4. Deploy **5 instances** in different cities (Newark, LA, Frankfurt, Singapore, Sydney)
+5. After ~2 minutes each IP is a proxy: `http://<ip>:3128`
+
+```bash
+# proxies.txt
+http://IP1:3128
+http://IP2:3128
+http://IP3:3128
+
+python3 pixieset_cracker.py -u site.pixieset.com -g jill --proxy-file proxies.txt
+```
+
+Destroy instances in the Vultr dashboard when done (hourly billing).
+
+### Option B — GitHub Actions (automation in the cloud)
+
+1. Vultr → API → Access Control → turn **ON** power for **Any IPv4** (`0.0.0.0/0`)
+2. Copy `templates/vultr-proxies.yml` → `.github/workflows/vultr-proxies.yml` in the repo (via GitHub web UI)
+3. Secret `VULTR_API_KEY` is already configured on the repo
+4. Actions → **Vultr Proxy Farm** → Run workflow → `deploy`
+5. Download the `proxies` artifact when green; use `destroy` to stop billing
+
+### Option C — script from an allowlisted machine
+
+```bash
+export VULTR_API_KEY=your-key
+bash vultr_deploy_local.sh          # deploy 5 proxies
+bash vultr_deploy_local.sh destroy  # tear down
+```
+
 ## Limitations
 
 - **3 passwords per gallery per run** — Pixieset's CAPTCHA is hard-capped. Rotate galleries or wait for the block to lift.
