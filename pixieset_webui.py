@@ -1085,6 +1085,269 @@ def fb_delete_one(account_index):
         return jsonify({"error": str(e)}), 400
 
 
+_OSINT_HISTORY_FILE = BASE_DIR / "osint_history.json"
+
+def _load_osint_history() -> list:
+    try:
+        return json.loads(_OSINT_HISTORY_FILE.read_text()) if _OSINT_HISTORY_FILE.exists() else []
+    except Exception:
+        return []
+
+def _save_osint_history(entries: list):
+    try:
+        _OSINT_HISTORY_FILE.write_text(json.dumps(entries[-200:], indent=2))
+    except Exception:
+        pass
+
+def _osint_record(query: str, qtype: str, result: dict):
+    entries = _load_osint_history()
+    entries.insert(0, {
+        "query": query, "type": qtype, "result": result,
+        "searched_at": datetime.utcnow().isoformat() + "Z",
+    })
+    _save_osint_history(entries)
+
+
+@app.route("/osint/lookup-email", methods=["POST"])
+def osint_lookup_email():
+    """Check if an email/phone is linked to a Facebook account via recovery page."""
+    data = request.get_json() or {}
+    email = (data.get("email") or data.get("query") or "").strip()
+    if not email:
+        return jsonify({"error": "Email or phone required"}), 400
+
+    sess = cffi_requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/110.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    })
+
+    results = {"query": email, "type": "email_lookup", "findings": []}
+
+    try:
+        resp = sess.get(
+            "https://mbasic.facebook.com/login/identify/?ctx=recover",
+            impersonate=IMPERSONATE, timeout=TIMEOUT, allow_redirects=True,
+        )
+        body = (resp.text or "")[:8000]
+
+        if 'name="email"' in body or 'name="friend_name"' in body:
+            resp2 = sess.post(
+                "https://mbasic.facebook.com/login/identify/?ctx=recover",
+                data={"email": email},
+                impersonate=IMPERSONATE, timeout=TIMEOUT, allow_redirects=True,
+            )
+            body2 = (resp2.text or "")[:8000]
+            final_url = resp2.url or ""
+
+            if "confirm" in body2.lower() and ("account" in body2.lower() or "reset" in body2.lower()):
+                results["findings"].append({
+                    "source": "recovery",
+                    "status": "account_found",
+                    "detail": "Facebook account exists for this email/phone",
+                    "response_snippet": body2[:400],
+                })
+            elif "no search results" in body2.lower() or "couldn't find" in body2.lower() or "not match" in body2.lower():
+                results["findings"].append({
+                    "source": "recovery",
+                    "status": "not_found",
+                    "detail": "No Facebook account found for this email/phone",
+                })
+            else:
+                results["findings"].append({
+                    "source": "recovery",
+                    "status": "unclear",
+                    "detail": f"Ambiguous response",
+                    "response_snippet": body2[:300],
+                })
+        else:
+            results["findings"].append({
+                "source": "recovery",
+                "status": "blocked",
+                "detail": "Could not access recovery page",
+            })
+    except Exception as e:
+        results["findings"].append({"source": "recovery", "status": "error", "detail": str(e)[:200]})
+
+    _osint_record(email, "email_lookup", results)
+    return jsonify(results)
+
+
+@app.route("/osint/profile", methods=["POST"])
+def osint_profile():
+    """Fetch public Facebook profile info by username or numeric ID."""
+    data = request.get_json() or {}
+    username = (data.get("username") or data.get("id") or data.get("query") or "").strip()
+    if not username:
+        return jsonify({"error": "Username or numeric profile ID required"}), 400
+
+    for prefix in ("https://www.facebook.com/", "https://facebook.com/", "http://facebook.com/"):
+        if username.startswith(prefix):
+            username = username[len(prefix):]
+            break
+    username = username.split("/")[0].split("?")[0].split("#")[0]
+
+    sess = cffi_requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/110.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    results = {"query": username, "type": "profile_lookup", "findings": [], "profile_data": {}}
+
+    try:
+        resp = sess.get(
+            f"https://mbasic.facebook.com/{username}",
+            impersonate=IMPERSONATE, timeout=TIMEOUT, allow_redirects=True,
+        )
+        body = (resp.text or "")[:10000]
+        final_url = resp.url or ""
+
+        if resp.status_code == 404 or "not found" in body.lower():
+            results["findings"].append({"source": "mbasic", "status": "not_found", "detail": "Profile not found"})
+        elif "login" in final_url and "login.php" in final_url:
+            results["findings"].append({"source": "mbasic", "status": "private", "detail": "Profile requires login"})
+        else:
+            import re
+            profile = {}
+            title_m = re.search(r'<title>(.*?)</title>', body, re.I)
+            if title_m:
+                profile["page_title"] = title_m.group(1).strip()
+
+            pid = username if username.isdigit() else None
+            if not username.isdigit():
+                id_m = re.search(r'"userID"\s*:\s*"?(\d+)"?', body)
+                if id_m:
+                    pid = id_m.group(1)
+                else:
+                    id_m2 = re.search(r'entity_id["\']?\s*[:=]\s*["\']?(\d+)', body)
+                    if id_m2:
+                        pid = id_m2.group(1)
+
+            if pid:
+                profile["user_id"] = pid
+                profile["profile_picture"] = f"https://graph.facebook.com/{pid}/picture?type=large"
+
+            bio_m = re.search(r'<div[^>]*class="[^"]*bio[^"]*"[^>]*>(.*?)</div>', body, re.I | re.S)
+            if bio_m:
+                profile["bio"] = re.sub(r'<[^>]+>', '', bio_m.group(1)).strip()[:500]
+
+            loc_m = re.search(r'lives in.*?<a[^>]*>(.*?)</a>', body, re.I)
+            if loc_m:
+                profile["location"] = loc_m.group(1).strip()
+
+            works = re.findall(r'works at.*?<a[^>]*>(.*?)</a>', body, re.I)
+            if works:
+                profile["work"] = list(set(works))
+
+            results["profile_data"] = profile
+            results["findings"].append({
+                "source": "mbasic",
+                "status": "success" if profile else "limited",
+                "detail": "Profile found" if profile else "Accessible but limited data",
+                "profile_url": f"https://facebook.com/{username}",
+            })
+    except Exception as e:
+        results["findings"].append({"source": "mbasic", "status": "error", "detail": str(e)[:200]})
+
+    _osint_record(username, "profile", results)
+    return jsonify(results)
+
+
+@app.route("/osint/search-name", methods=["POST"])
+def osint_search_name():
+    """Search Facebook for people by name."""
+    data = request.get_json() or {}
+    name = (data.get("name") or data.get("query") or "").strip()
+    if not name:
+        return jsonify({"error": "Name required"}), 400
+
+    sess = cffi_requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/110.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    results = {"query": name, "type": "name_search", "profiles": []}
+
+    try:
+        import urllib.parse
+        q = urllib.parse.quote(name)
+        resp = sess.get(
+            f"https://mbasic.facebook.com/search/people/?q={q}",
+            impersonate=IMPERSONATE, timeout=TIMEOUT, allow_redirects=True,
+        )
+        body = (resp.text or "")[:15000]
+
+        if "login" in (resp.url or ""):
+            results["error"] = "Facebook requires login for name search"
+        else:
+            import re
+            links = re.findall(r'href="/([^"]+?)\?[^"]*"[^>]*>(.*?)</a>', body, re.I | re.S)
+            seen = set()
+            for href, label in links:
+                href = href.strip()
+                if href in seen or "php" in href or not href:
+                    continue
+                seen.add(href)
+                clean_label = re.sub(r'<[^>]+>', '', label).strip()
+                if not clean_label or len(clean_label) < 2:
+                    continue
+                results["profiles"].append({
+                    "username": href.split("?")[0],
+                    "url": f"https://facebook.com/{href.split('?')[0]}",
+                    "name": clean_label[:100],
+                })
+            if not results["profiles"]:
+                results["note"] = "No public profiles found"
+    except Exception as e:
+        results["error"] = str(e)[:200]
+
+    _osint_record(name, "name_search", results)
+    return jsonify(results)
+
+
+@app.route("/osint/avatar", methods=["POST"])
+def osint_avatar():
+    """Get profile picture URL(s) from numeric Facebook user ID."""
+    data = request.get_json() or {}
+    uid = (data.get("id") or data.get("uid") or "").strip()
+    if not uid or not uid.isdigit():
+        return jsonify({"error": "Numeric user ID required"}), 400
+
+    results = {
+        "user_id": uid,
+        "profile_picture": f"https://graph.facebook.com/{uid}/picture?type=large",
+        "profile_picture_small": f"https://graph.facebook.com/{uid}/picture?type=small",
+        "profile_picture_normal": f"https://graph.facebook.com/{uid}/picture?type=normal",
+        "profile_picture_square": f"https://graph.facebook.com/{uid}/picture?type=square",
+    }
+    try:
+        resp = cffi_requests.get(
+            results["profile_picture"],
+            impersonate=IMPERSONATE, timeout=10, allow_redirects=False,
+        )
+        results["status"] = resp.status_code
+        results["redirect_url"] = resp.headers.get("Location", "")
+    except Exception as e:
+        results["status"] = "error"
+        results["error"] = str(e)[:100]
+
+    _osint_record(uid, "avatar", results)
+    return jsonify(results)
+
+
+@app.route("/osint/history", methods=["GET"])
+def osint_history():
+    return jsonify({"history": _load_osint_history(), "count": len(_load_osint_history())})
+
+@app.route("/osint/clear", methods=["DELETE"])
+def osint_clear():
+    _save_osint_history([])
+    return jsonify({"ok": True, "count": 0})
+
 # ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
@@ -1197,6 +1460,7 @@ tr:hover td { background: rgba(88,166,255,0.04); }
     <button class="tab" onclick="switchTab('tester')">🔑 Password Tester</button>
     <button class="tab" onclick="switchTab('farm')">🌾 Farm Brute Force</button>
     <button class="tab" onclick="switchTab('found')">🔓 Found Passwords</button>
+    <button class="tab" onclick="switchTab('osint')">📡 OSINT</button>
     <button class="tab" onclick="switchTab('facebook')">📘 Facebook</button>
     <button class="tab" onclick="switchTab('jsview')">📜 JS Inspector</button>
   </div>
@@ -1303,6 +1567,65 @@ tr:hover td { background: rgba(88,166,255,0.04); }
       <div>
         <h2>Job Detail / Log</h2>
         <div id="farm-detail"><p class="subtitle">Select a job to watch live progress.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========= OSINT TAB ========= -->
+  <div id="tab-osint" class="tab-panel">
+    <p class="subtitle">Facebook intelligence gathering — email lookup, profile scraping, name search, avatar retrieval.</p>
+
+    <div class="split">
+      <div>
+        <div class="card mb10">
+          <div class="card-header">Email / Phone Lookup</div>
+          <p class="subtitle" style="margin:4px 0 8px">Checks if an email or phone is linked to a Facebook account via the account recovery page.</p>
+          <div class="row">
+            <input type="text" id="osint-email" placeholder="email@example.com or +15551234567" style="flex:2">
+            <button class="btn btn-primary btn-sm" onclick="doOSINTLookup('email')" style="flex:0 0 auto">Lookup</button>
+          </div>
+          <div id="osint-email-result" style="margin-top:8px"></div>
+        </div>
+
+        <div class="card mb10">
+          <div class="card-header">Profile Lookup</div>
+          <p class="subtitle" style="margin:4px 0 8px">Pull public profile info by username or numeric Facebook ID.</p>
+          <div class="row">
+            <input type="text" id="osint-profile" placeholder="username or facebook.com/username" style="flex:2">
+            <button class="btn btn-primary btn-sm" onclick="doOSINTLookup('profile')" style="flex:0 0 auto">Lookup</button>
+          </div>
+          <div id="osint-profile-result" style="margin-top:8px"></div>
+        </div>
+
+        <div class="card mb10">
+          <div class="card-header">Avatar / Profile Picture</div>
+          <p class="subtitle" style="margin:4px 0 8px">Retrieve profile pictures from a numeric Facebook user ID via Graph API.</p>
+          <div class="row">
+            <input type="text" id="osint-avatar-id" placeholder="Numeric user ID (e.g. 100000123456789)" style="flex:2">
+            <button class="btn btn-primary btn-sm" onclick="doOSINTLookup('avatar')" style="flex:0 0 auto">Get Avatar</button>
+          </div>
+          <div id="osint-avatar-result" style="margin-top:8px"></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card mb10">
+          <div class="card-header">Search by Name</div>
+          <p class="subtitle" style="margin:4px 0 8px">Search Facebook people directory by full name.</p>
+          <div class="row">
+            <input type="text" id="osint-name" placeholder="Full name (e.g. Sarah Hill)" style="flex:2">
+            <button class="btn btn-primary btn-sm" onclick="doOSINTLookup('name')" style="flex:0 0 auto">Search</button>
+          </div>
+          <div id="osint-name-result" style="margin-top:8px"></div>
+        </div>
+
+        <div class="mt10">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h2>Lookup History</h2>
+            <button class="btn btn-red btn-sm" onclick="doOSINTClear()">Clear</button>
+          </div>
+          <div id="osint-history"><p class="subtitle">No lookups yet.</p></div>
+        </div>
       </div>
     </div>
   </div>
@@ -1776,6 +2099,127 @@ async function showFarmDetail(jobId, silent) {
   }
 }
 
+// ---- OSINT TOOLS ----
+async function doOSINTLookup(type) {
+  let endpoint, payload;
+  const resultEl = $('osint-' + type + '-result');
+  if (!resultEl) return;
+
+  switch(type) {
+    case 'email':
+      const email = $('osint-email').value.trim();
+      if (!email) { resultEl.innerHTML = '<p style="color:var(--yellow)">Enter email or phone</p>'; return; }
+      endpoint = '/osint/lookup-email'; payload = {email};
+      break;
+    case 'profile':
+      const profile = $('osint-profile').value.trim();
+      if (!profile) { resultEl.innerHTML = '<p style="color:var(--yellow)">Enter username or ID</p>'; return; }
+      endpoint = '/osint/profile'; payload = {username: profile};
+      break;
+    case 'avatar':
+      const uid = $('osint-avatar-id').value.trim();
+      if (!uid || !/^\d+$/.test(uid)) { resultEl.innerHTML = '<p style="color:var(--yellow)">Enter numeric user ID</p>'; return; }
+      endpoint = '/osint/avatar'; payload = {id: uid};
+      break;
+    case 'name':
+      const name = $('osint-name').value.trim();
+      if (!name) { resultEl.innerHTML = '<p style="color:var(--yellow)">Enter a name</p>'; return; }
+      endpoint = '/osint/search-name'; payload = {name};
+      break;
+  }
+  resultEl.innerHTML = '<div class="loading visible"><span class="spinner"></span> Looking up...</div>';
+  try {
+    const r = await fetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    const d = await r.json();
+    renderOSINTResult(type, d);
+  } catch(e) {
+    resultEl.innerHTML = '<p style="color:var(--red)">Error: ' + esc(e.message) + '</p>';
+  }
+  loadOSINTHistory();
+}
+
+function renderOSINTResult(type, d) {
+  const el = $('osint-' + type + '-result');
+  if (!el) return;
+  if (d.error) { el.innerHTML = '<p style="color:var(--red)">' + esc(d.error) + '</p>'; return; }
+
+  if (type === 'email') {
+    let html = '<div class="stats mb10">' + statBox('Query', esc(d.query), '') + statBox('Status', (d.findings||[]).map(f=>f.status).join(', ')||'?', '') + '</div>';
+    (d.findings||[]).forEach(f => {
+      const color = f.status === 'account_found' ? 'var(--green)' : (f.status === 'not_found' ? 'var(--red)' : 'var(--yellow)');
+      html += '<div class="finding finding-low" style="border-left-color:' + color + '"><strong>' + esc(f.source) + '</strong>: ' + esc(f.detail) + '</div>';
+    });
+    el.innerHTML = html;
+  } else if (type === 'profile') {
+    let html = '';
+    const pd = d.profile_data || {};
+    if (pd.page_title) html += '<p><strong>Title:</strong> ' + esc(pd.page_title) + '</p>';
+    if (pd.user_id) html += '<p><strong>User ID:</strong> <code>' + esc(pd.user_id) + '</code></p>';
+    if (pd.location) html += '<p><strong>Location:</strong> ' + esc(pd.location) + '</p>';
+    if (pd.work) html += '<p><strong>Work:</strong> ' + esc(pd.work.join(', ')) + '</p>';
+    if (pd.bio) html += '<p><strong>Bio:</strong> ' + esc(pd.bio) + '</p>';
+    if (pd.profile_picture) {
+      html += '<p><strong>Profile Pic:</strong> <a href="' + esc(pd.profile_picture) + '" target="_blank"><code>' + esc(pd.profile_picture) + '</code></a></p>';
+      html += '<img src="' + esc(pd.profile_picture) + '" style="max-width:120px;border-radius:8px;margin-top:4px" onerror="this.style.display=\'none\'">';
+    }
+    (d.findings||[]).forEach(f => {
+      html += '<div class="finding finding-low"><strong>' + esc(f.source) + '</strong>: ' + esc(f.detail);
+      if (f.profile_url) html += ' <a href="' + esc(f.profile_url) + '" target="_blank" style="font-size:0.85em">open</a>';
+      html += '</div>';
+    });
+    el.innerHTML = html ? '<div class="card">' + html + '</div>' : '<p class="subtitle">No data returned.</p>';
+  } else if (type === 'avatar') {
+    let html = '<div class="stats mb10">' + statBox('User ID', esc(d.user_id), '') + statBox('Status', d.status, '') + '</div>';
+    if (d.profile_picture) {
+      html += '<a href="' + esc(d.profile_picture) + '" target="_blank"><img src="' + esc(d.profile_picture) + '" style="max-width:160px;border-radius:8px;margin:4px 0" onerror="this.style.display=\'none\'"></a>';
+      html += '<p style="font-size:0.8em;word-break:break-all"><strong>Large:</strong> <code>' + esc(d.profile_picture) + '</code></p>';
+      html += '<p style="font-size:0.8em"><strong>Normal:</strong> <code>' + esc(d.profile_picture_normal) + '</code></p>';
+      html += '<p style="font-size:0.8em"><strong>Small:</strong> <code>' + esc(d.profile_picture_small) + '</code></p>';
+    }
+    el.innerHTML = '<div class="card">' + html + '</div>';
+  } else if (type === 'name') {
+    let html = '<div class="stats mb10">' + statBox('Query', esc(d.query), '') + statBox('Results', (d.profiles||[]).length, 'var(--accent)') + '</div>';
+    if (d.error) html += '<p style="color:var(--red)">' + esc(d.error) + '</p>';
+    if (d.note) html += '<p class="subtitle">' + esc(d.note) + '</p>';
+    (d.profiles||[]).forEach(p => {
+      html += '<div class="finding finding-low"><strong>' + esc(p.name) + '</strong><br><a href="' + esc(p.url) + '" target="_blank"><code>' + esc(p.url) + '</code></a></div>';
+    });
+    el.innerHTML = html;
+  }
+}
+
+async function loadOSINTHistory() {
+  try {
+    const r = await fetch('/osint/history');
+    const d = await r.json();
+    const history = d.history || [];
+    if (!history.length) {
+      $('osint-history').innerHTML = '<p class="subtitle">No lookups yet.</p>';
+      return;
+    }
+    let html = '';
+    history.slice(0, 30).forEach(h => {
+      const icons = {email_lookup: '\ud83d\udce7', profile: '\ud83d\udc64', avatar: '\ud83d\uddbc', name_search: '\ud83d\udd0d'};
+      const icon = icons[h.type] || '\ud83c\udf10';
+      const st = (h.result || {}).findings ? (h.result.findings[0]||{}).status : '?';
+      let color = 'var(--text2)';
+      if (st === 'account_found' || st === 'success') color = 'var(--green)';
+      else if (st === 'not_found') color = 'var(--red)';
+      html += '<div class="finding finding-low" style="padding:6px 10px;margin:4px 0">';
+      html += '<span style="color:' + color + '">' + icon + '</span> <strong>' + esc(h.type) + '</strong>: <code>' + esc(h.query) + '</code>';
+      html += ' <span style="font-size:0.75em;color:var(--text2)">' + esc((h.searched_at||'').replace('T',' ').substring(0,19)) + '</span>';
+      html += '</div>';
+    });
+    $('osint-history').innerHTML = html;
+  } catch(e) {}
+}
+
+async function doOSINTClear() {
+  if (!confirm('Clear all OSINT lookup history?')) return;
+  await fetch('/osint/clear', {method: 'DELETE'});
+  loadOSINTHistory();
+}
+
 // ---- FACEBOOK ACCOUNTS ----
 let _fbProxies = [];
 
@@ -2004,6 +2448,7 @@ loadFarmJobs();
 loadFound();
 loadFBProxies();
 loadFBAccounts();
+loadOSINTHistory();
 </script>
 </body>
 </html>"""
@@ -2031,6 +2476,7 @@ def main():
 ║   🔑 Tester    — Manual password testing                ║
 ║   🌾 Farm     — Multi-IP bulk brute force              ║
 ║   🔓 Found    — Cracked passwords vault                ║
+║   📡 OSINT    — FB intelligence: lookup, profile, avatar ║
 ║   📘 Facebook — Account credential testing             ║
 ║   📜 JS        — External JS secret scanning            ║
 ╚══════════════════════════════════════════════════════════╝
