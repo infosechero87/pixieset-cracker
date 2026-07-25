@@ -330,14 +330,42 @@ class ProxyRotator:
             }
 
     def _load_from_file(self, path: str):
-        """Load proxies from a JSON file."""
+        """Load proxies from JSON (list of {url}) or plain-text (one URL per line)."""
         with open(path) as f:
-            data = json.load(f)
-        for item in data:
-            p = Proxy.from_string(item.get("url", ""), item.get("source", "file"))
-            if p:
-                self._pool.append(p)
-        print(f"  [proxy] Loaded {len(self._pool)} proxies from {path}")
+            raw = f.read().strip()
+        if not raw:
+            print(f"  [proxy] Empty file: {path}")
+            return
+        loaded = 0
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        url = item.get("url", "")
+                    else:
+                        url = str(item)
+                    p = Proxy.from_string(url, item.get("source", "file") if isinstance(item, dict) else "file")
+                    if p:
+                        self._pool.append(p)
+                        loaded += 1
+            elif isinstance(data, dict) and "proxies" in data:
+                for item in data["proxies"]:
+                    url = item.get("url", item) if isinstance(item, dict) else str(item)
+                    p = Proxy.from_string(url, "file")
+                    if p:
+                        self._pool.append(p)
+                        loaded += 1
+        except json.JSONDecodeError:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                p = Proxy.from_string(line, "file")
+                if p:
+                    self._pool.append(p)
+                    loaded += 1
+        print(f"  [proxy] Loaded {loaded} proxies from {path}")
 
     def save_to_file(self, path: str):
         """Export current pool to a JSON file for later reuse."""

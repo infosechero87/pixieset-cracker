@@ -9,3 +9,7 @@ build/
 pixieset_results.json
 proxies.json
 .DS_Store
+
+proxies.txt
+proxies.json
+.vultr_proxy_ids
