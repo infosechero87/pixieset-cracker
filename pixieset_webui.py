@@ -371,6 +371,37 @@ _JOBS_LOCK = threading.Lock()
 _JOB_EXEC = ThreadPoolExecutor(max_workers=2)
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROXIES = BASE_DIR / "proxies.txt"
+_FOUND_FILE = BASE_DIR / "found_passwords.json"
+
+def _load_found() -> list:
+    """Load found passwords from disk."""
+    try:
+        return json.loads(_FOUND_FILE.read_text()) if _FOUND_FILE.exists() else []
+    except Exception:
+        return []
+
+def _save_found(entries: list):
+    """Persist found passwords to disk."""
+    try:
+        _FOUND_FILE.write_text(json.dumps(entries, indent=2))
+    except Exception:
+        pass
+
+def _record_found(host: str, slug: str, password: str, source: str = "farm"):
+    """Record a cracked password. Deduplicates by host+slug."""
+    entries = _load_found()
+    # remove any existing entry for same host+slug
+    entries = [e for e in entries if not (e.get("host") == host and e.get("slug") == slug)]
+    entries.insert(0, {
+        "host": host,
+        "slug": slug,
+        "password": password,
+        "gallery_url": f"https://{host}/{slug}/",
+        "login_url": f"https://{host}/guestlogin/{slug}/",
+        "source": source,
+        "found_at": datetime.utcnow().isoformat() + "Z",
+    })
+    _save_found(entries)
 
 
 def _parse_gallery_url(raw: str) -> tuple[str, str]:
@@ -472,6 +503,7 @@ def _run_farm_job(job_id: str):
             job["finished_at"] = datetime.utcnow().isoformat() + "Z"
             if result.found_password:
                 job["log"].append(f"[{_ts()}] ✓ CRACKED — password={result.found_password}")
+                _record_found(job["host"], job["slug"], result.found_password, "farm")
             else:
                 job["log"].append(f"[{_ts()}] finished — no hit ({len(attempts_out)} attempts)")
 
@@ -853,6 +885,9 @@ def test_password():
     # Check if either field succeeded
     any_success = any(r.get("success") for r in results)
 
+    if any_success:
+        _record_found(parsed.netloc, slug, password, "tester")
+
     return jsonify({
         "slug": slug,
         "password_tested": password,
@@ -861,6 +896,43 @@ def test_password():
         "results": results,
     })
 
+
+@app.route("/found", methods=["GET"])
+def found_list():
+    """Return all found/cracked passwords."""
+    return jsonify({"found": _load_found(), "count": len(_load_found())})
+
+@app.route("/found", methods=["POST"])
+def found_add():
+    """Manually add a found password entry."""
+    data = request.get_json() or {}
+    host = (data.get("host") or "").strip()
+    slug = (data.get("slug") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not host or not slug or not password:
+        return jsonify({"error": "host, slug, and password required"}), 400
+    _record_found(host, slug, password, data.get("source", "manual"))
+    return jsonify({"ok": True, "count": len(_load_found())})
+
+@app.route("/found", methods=["DELETE"])
+def found_clear():
+    """Clear all found passwords."""
+    _save_found([])
+    return jsonify({"ok": True, "count": 0})
+
+@app.route("/found/<entry_index>", methods=["DELETE"])
+def found_delete_one(entry_index):
+    """Delete a single found entry by index."""
+    try:
+        idx = int(entry_index)
+        entries = _load_found()
+        if 0 <= idx < len(entries):
+            del entries[idx]
+            _save_found(entries)
+            return jsonify({"ok": True, "count": len(entries)})
+        return jsonify({"error": "index out of range"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 # ---------------------------------------------------------------------------
 # HTML Template
@@ -973,6 +1045,7 @@ tr:hover td { background: rgba(88,166,255,0.04); }
     <button class="tab" onclick="switchTab('proxy')">🔁 Proxy / Repeater</button>
     <button class="tab" onclick="switchTab('tester')">🔑 Password Tester</button>
     <button class="tab" onclick="switchTab('farm')">🌾 Farm Brute Force</button>
+    <button class="tab" onclick="switchTab('found')">🔓 Found Passwords</button>
     <button class="tab" onclick="switchTab('jsview')">📜 JS Inspector</button>
   </div>
 
@@ -1078,6 +1151,24 @@ tr:hover td { background: rgba(88,166,255,0.04); }
       <div>
         <h2>Job Detail / Log</h2>
         <div id="farm-detail"><p class="subtitle">Select a job to watch live progress.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========= FOUND PASSWORDS TAB ========= -->
+  <div id="tab-found" class="tab-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <p class="subtitle" style="margin:0">All cracked gallery passwords — auto-recorded from Farm jobs & Password Tester.</p>
+      <button class="btn btn-red btn-sm" onclick="doClearFound()">Clear All</button>
+    </div>
+    <div id="found-list"><p class="subtitle">Nothing cracked yet. Run Farm Brute Force or Password Tester to populate.</p></div>
+    <div class="mt20" id="found-add-form" style="display:none">
+      <h2>Add Manually</h2>
+      <div class="row mb10" style="gap:8px">
+        <input id="found-host" placeholder="host (e.g. sarahhillphotography15.pixieset.com)" style="flex:2">
+        <input id="found-slug" placeholder="slug (e.g. jill)" style="flex:1">
+        <input id="found-pass" placeholder="password" style="flex:1">
+        <button class="btn btn-sm" onclick="doAddFound()">Add</button>
       </div>
     </div>
   </div>
@@ -1498,10 +1589,71 @@ async function showFarmDetail(jobId, silent) {
   }
 }
 
+// ---- FOUND PASSWORDS ----
+async function loadFound() {
+  try {
+    const r = await fetch('/found');
+    const d = await r.json();
+    const found = d.found || [];
+    if (!found.length) {
+      $('found-list').innerHTML = '<p class="subtitle">Nothing cracked yet. Run Farm Brute Force or Password Tester to populate.</p>';
+      return;
+    }
+    let html = '<table><tr><th>#</th><th>Gallery</th><th>Slug</th><th>Password</th><th>Source</th><th>Found</th><th></th></tr>';
+    found.forEach((f, i) => {
+      html += '<tr>';
+      html += '<td>' + (i+1) + '</td>';
+      html += '<td><a href="' + esc(f.gallery_url) + '" target="_blank" style="color:var(--accent)">' + esc(f.host) + '</a></td>';
+      html += '<td><code>' + esc(f.slug) + '</code></td>';
+      html += '<td><code style="color:var(--green);font-size:1.05em;font-weight:600">' + esc(f.password) + '</code></td>';
+      html += '<td><span class="badge">' + esc(f.source||'?') + '</span></td>';
+      html += '<td style="font-size:0.8em;color:var(--text2)">' + esc((f.found_at||'').replace('T',' ').substring(0,19)) + '</td>';
+      html += '<td><button class="btn btn-sm btn-red" onclick="doDeleteFound(' + i + ')">✕</button></td>';
+      html += '</tr>';
+      html += '<tr><td></td><td colspan="6" style="padding-top:0;font-size:0.8em">Login: <code>' + esc(f.login_url||'') + '</code> &nbsp; Gallery: <a href="' + esc(f.gallery_url) + '" target="_blank">open</a></td></tr>';
+    });
+    html += '</table>';
+    $('found-list').innerHTML = html;
+    $('found-add-form').style.display = 'block';
+  } catch(e) {
+    $('found-list').innerHTML = '<p style="color:var(--red)">Error: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function doClearFound() {
+  if (!confirm('Delete ALL found passwords? This cannot be undone.')) return;
+  try {
+    await fetch('/found', {method: 'DELETE'});
+    loadFound();
+  } catch(e) {}
+}
+
+async function doDeleteFound(idx) {
+  try {
+    await fetch('/found/' + idx, {method: 'DELETE'});
+    loadFound();
+  } catch(e) {}
+}
+
+async function doAddFound() {
+  const host = $('found-host').value.trim();
+  const slug = $('found-slug').value.trim();
+  const pass = $('found-pass').value.trim();
+  if (!host || !slug || !pass) return;
+  try {
+    await fetch('/found', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({host,slug,password:pass,source:'manual'})});
+    $('found-host').value = '';
+    $('found-slug').value = '';
+    $('found-pass').value = '';
+    loadFound();
+  } catch(e) {}
+}
+
 // Load history on proxy tab open (lazy)
 loadHistory();
 loadFarmProxies();
 loadFarmJobs();
+loadFound();
 </script>
 </body>
 </html>"""
@@ -1528,6 +1680,7 @@ def main():
 ║   🔁 Proxy     — Burp-style request/repeater            ║
 ║   🔑 Tester    — Manual password testing                ║
 ║   🌾 Farm     — Multi-IP bulk brute force              ║
+║   🔓 Found    — Cracked passwords vault                ║
 ║   📜 JS        — External JS secret scanning            ║
 ╚══════════════════════════════════════════════════════════╝
 """)
